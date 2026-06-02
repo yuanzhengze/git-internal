@@ -142,7 +142,7 @@ fn encode_header(object_number: usize) -> Vec<u8> {
 /// Encode offset of delta object
 fn encode_offset(mut value: usize) -> Vec<u8> {
     assert_ne!(value, 0, "offset can't be zero");
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(std::mem::size_of::<usize>());
 
     bytes.push((value & 0x7F) as u8);
     value >>= 7;
@@ -164,25 +164,24 @@ fn encode_one_object(entry: &Entry, offset: Option<usize>) -> Result<Vec<u8>, Gi
     let obj_data_len = obj_data.len();
     let obj_type_number = entry.obj_type.to_pack_type_u8()?;
 
-    let mut encoded_data = Vec::new();
+    let mut encoded_data = Vec::with_capacity(16 + obj_data_len);
 
     // **header** encoding
-    let mut header_data = vec![(0x80 | (obj_type_number << 4)) + (obj_data_len & 0x0f) as u8];
+    encoded_data.push((0x80 | (obj_type_number << 4)) + (obj_data_len & 0x0f) as u8);
     let mut size = obj_data_len >> 4; // 4 bit has been used in first byte
     if size > 0 {
         while size > 0 {
             if size >> 7 > 0 {
-                header_data.push((0x80 | size) as u8);
+                encoded_data.push((0x80 | size) as u8);
                 size >>= 7;
             } else {
-                header_data.push(size as u8);
+                encoded_data.push(size as u8);
                 break;
             }
         }
     } else {
-        header_data.push(0);
+        encoded_data.push(0);
     }
-    encoded_data.extend(header_data);
 
     // **offset** encoding
     if entry.obj_type == ObjectType::OffsetDelta || entry.obj_type == ObjectType::OffsetZstdelta {
@@ -446,14 +445,14 @@ impl PackEncoder {
         let blob_res = blob_results?;
         let tag_res = tag_results?;
 
-        let mut all_res = vec![commit_res, tree_res, blob_res, tag_res];
+        let all_res = [commit_res, tree_res, blob_res, tag_res];
 
-        let mut idx_entries = Vec::new();
-        for res in &mut all_res {
-            for data in res {
-                data.1.offset = self.inner_offset as u64;
-                self.write_all_and_update(&data.0).await;
-                idx_entries.push(data.1.clone());
+        let mut idx_entries = Vec::with_capacity(self.object_number);
+        for res in all_res {
+            for (obj_data, mut idx_entry) in res {
+                idx_entry.offset = self.inner_offset as u64;
+                self.write_all_and_update(&obj_data).await;
+                idx_entries.push(idx_entry);
             }
         }
 
@@ -482,7 +481,7 @@ impl PackEncoder {
     ) -> Result<Vec<(Vec<u8>, IndexEntry)>, GitError> {
         let mut current_offset = 0usize;
         let mut window: VecDeque<(Entry, usize)> = VecDeque::with_capacity(window_size);
-        let mut res: Vec<(Vec<u8>, IndexEntry)> = Vec::new();
+        let mut res: Vec<(Vec<u8>, IndexEntry)> = Vec::with_capacity(bucket.len());
         //let mut idx_entries: Vec<IndexEntry> = Vec::new();
 
         for entry in bucket.iter_mut() {
@@ -580,12 +579,13 @@ impl PackEncoder {
 
             entry_for_window.chain_len = entry.chain_len;
             let obj_data = encode_one_object(entry, offset)?;
+            let obj_data_len = obj_data.len();
             window.push_back((entry_for_window, current_offset));
             if window.len() > window_size {
                 window.pop_front();
             }
-            res.push((obj_data.clone(), IndexEntry::new(entry, 0)));
-            current_offset += obj_data.len();
+            res.push((obj_data, IndexEntry::new(entry, 0)));
+            current_offset += obj_data_len;
         }
         Ok(res)
     }
@@ -612,7 +612,7 @@ impl PackEncoder {
             ));
         }
 
-        let mut idx_entries = Vec::new();
+        let mut idx_entries = Vec::with_capacity(self.object_number);
         let batch_size = usize::max(1000, entry_rx.max_capacity() / 10); // A temporary value, not optimized
         tracing::info!("encode with batch size: {}", batch_size);
         loop {
@@ -924,6 +924,38 @@ mod tests {
             .await
             .expect_err("must reject AI pack type");
         assert!(matches!(err, GitError::PackEncodeError(_)));
+    }
+
+    #[test]
+    fn test_try_as_offset_delta_keeps_one_result_per_input() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let entries: Vec<Entry> = [
+            "hello pack encode",
+            "hello pack encoder",
+            "hello pack encoding",
+            "a very different blob",
+        ]
+        .into_iter()
+        .map(|content| Blob::from_content(content).into())
+        .collect();
+        let expected_hashes: Vec<ObjectHash> = entries.iter().map(|entry| entry.hash).collect();
+
+        let result = PackEncoder::try_as_offset_delta(entries, 2, false).unwrap();
+
+        assert_eq!(result.len(), expected_hashes.len());
+        for ((encoded_data, index_entry), expected_hash) in result.iter().zip(expected_hashes) {
+            assert!(!encoded_data.is_empty());
+            assert_eq!(index_entry.hash, expected_hash);
+            assert_eq!(index_entry.offset, 0);
+        }
+    }
+
+    #[test]
+    fn test_try_as_offset_delta_empty_bucket_returns_empty_result() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let result = PackEncoder::try_as_offset_delta(Vec::new(), 4, false).unwrap();
+
+        assert!(result.is_empty());
     }
 
     async fn get_entries_for_test() -> (Arc<Mutex<Vec<Entry>>>, PackFileGuard) {
